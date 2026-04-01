@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from app.scraper import scrape_carrier, fetch_insurance_data
 from app.database import upsert_carrier, update_carrier_insurance
+
 _MAX_COMPLETED_TASKS = 20
 class TaskManager:
     def __init__(self):
@@ -142,6 +143,7 @@ class TaskManager:
                     latency = data.pop("_latency", None)
                     if latency:
                         self._log_latency(task_id, mc, latency)
+
                     entity_type = (data.get("entityType") or "").upper()
                     status_text = (data.get("status") or "").upper()
                     is_carrier = "CARRIER" in entity_type
@@ -303,6 +305,7 @@ class TaskManager:
             task_id,
             f"[Latency] MC {mc}: total={total}ms | {breakdown}",
         )
+
     def _add_log(self, task_id: str, message: str):
         if task_id in self.tasks:
             logs = self.tasks[task_id]["logs"]
