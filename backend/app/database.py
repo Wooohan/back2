@@ -13,7 +13,6 @@ _pool: Optional[asyncpg.Pool] = None
 
 
 _SCHEMA_SQL = """
--- ── Tables ──────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS carriers (
     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
     mc_number TEXT NOT NULL UNIQUE,
@@ -87,7 +86,23 @@ CREATE TABLE IF NOT EXISTS blocked_ips (
     blocked_by TEXT
 );
 
--- ── Indexes ─────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS insurance_history (
+    id SERIAL PRIMARY KEY,
+    docket_number VARCHAR(20),
+    dot_number VARCHAR(20),
+    ins_form_code VARCHAR(10),
+    ins_type_desc VARCHAR(50),
+    name_company VARCHAR(100),
+    policy_no VARCHAR(50),
+    trans_date VARCHAR(15),
+    underl_lim_amount VARCHAR(15),
+    max_cov_amount VARCHAR(15),
+    effective_date VARCHAR(15),
+    cancl_effective_date VARCHAR(15),
+    effective_date_parsed DATE,
+    cancl_date_parsed DATE
+);
+
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 CREATE INDEX IF NOT EXISTS idx_carriers_mc_number ON carriers(mc_number);
@@ -95,7 +110,6 @@ CREATE INDEX IF NOT EXISTS idx_carriers_dot_number ON carriers(dot_number);
 CREATE INDEX IF NOT EXISTS idx_carriers_created_at ON carriers(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_carriers_status ON carriers(status);
 
--- Trigram indexes for fast ILIKE text search on carriers
 CREATE INDEX IF NOT EXISTS idx_carriers_legal_name_trgm ON carriers USING gin (legal_name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_carriers_mc_number_trgm ON carriers USING gin (mc_number gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_carriers_dot_number_trgm ON carriers USING gin (dot_number gin_trgm_ops);
@@ -113,8 +127,16 @@ CREATE INDEX IF NOT EXISTS idx_blocked_ips_ip ON blocked_ips(ip_address);
 CREATE INDEX IF NOT EXISTS idx_insurance_history_docket ON insurance_history(docket_number);
 CREATE INDEX IF NOT EXISTS idx_insurance_history_docket_type ON insurance_history(docket_number, ins_type_desc);
 CREATE INDEX IF NOT EXISTS idx_insurance_history_docket_cancl ON insurance_history(docket_number, cancl_effective_date);
+CREATE INDEX IF NOT EXISTS idx_ih_docket_type_cancl ON insurance_history(docket_number, ins_type_desc, cancl_effective_date);
+CREATE INDEX IF NOT EXISTS idx_ih_docket_company ON insurance_history(docket_number, name_company);
+CREATE INDEX IF NOT EXISTS idx_ih_docket_effective ON insurance_history(docket_number, effective_date);
+CREATE INDEX IF NOT EXISTS idx_insurance_history_docket_number ON insurance_history(docket_number);
+CREATE INDEX IF NOT EXISTS idx_insurance_history_ins_type_trgm ON insurance_history USING gin (ins_type_desc gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_insurance_history_cancl_effective ON insurance_history(cancl_effective_date);
+CREATE INDEX IF NOT EXISTS idx_insurance_history_docket_type_active ON insurance_history(docket_number, ins_type_desc, cancl_effective_date);
+CREATE INDEX IF NOT EXISTS idx_insurance_history_effective_date ON insurance_history(effective_date);
+CREATE INDEX IF NOT EXISTS idx_insurance_history_max_cov_amount ON insurance_history(max_cov_amount);
 
--- ── Timestamp triggers ──────────────────────────────────────────────────────
 CREATE OR REPLACE FUNCTION update_carriers_updated_at()
 RETURNS TRIGGER AS $$ BEGIN NEW.updated_at = NOW(); RETURN NEW; END; $$ LANGUAGE plpgsql;
 
@@ -136,7 +158,6 @@ DROP TRIGGER IF EXISTS update_users_updated_at ON users;
 CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
     FOR EACH ROW EXECUTE FUNCTION update_users_updated_at();
 
--- ── New Ventures table (ALL BrokerSnapshot CSV columns) ──────────────────────
 CREATE TABLE IF NOT EXISTS new_ventures (
     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
     dot_number TEXT,
@@ -318,7 +339,6 @@ CREATE INDEX IF NOT EXISTS idx_new_ventures_email ON new_ventures(email_address)
 CREATE INDEX IF NOT EXISTS idx_new_ventures_hm_ind ON new_ventures(hm_ind);
 CREATE INDEX IF NOT EXISTS idx_new_ventures_carrier_op ON new_ventures(carrier_operation);
 
--- Trigram indexes for fast ILIKE text search on new_ventures
 CREATE INDEX IF NOT EXISTS idx_new_ventures_name_trgm ON new_ventures USING gin (name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_new_ventures_name_dba_trgm ON new_ventures USING gin (name_dba gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_new_ventures_dot_trgm ON new_ventures USING gin (dot_number gin_trgm_ops);
@@ -331,7 +351,6 @@ DROP TRIGGER IF EXISTS update_new_ventures_updated_at ON new_ventures;
 CREATE TRIGGER update_new_ventures_updated_at BEFORE UPDATE ON new_ventures
     FOR EACH ROW EXECUTE FUNCTION update_new_ventures_updated_at();
 
--- ── Default admin user ──────────────────────────────────────────────────────
 INSERT INTO users (user_id, name, email, role, plan, daily_limit, records_extracted_today, ip_address, is_online, is_blocked)
 VALUES ('1', 'Admin User', 'wooohan3@gmail.com', 'admin', 'Enterprise', 100000, 0, '192.168.1.1', false, false)
 ON CONFLICT (email) DO NOTHING;
@@ -738,7 +757,6 @@ async def fetch_carriers(filters: dict) -> dict:
         idx += 1
 
     _INS_TYPE_PATTERN = {"BI&PD": "BIPD%", "CARGO": "CARGO", "BOND": "SURETY", "TRUST FUND": "TRUST FUND"}
-
     if filters.get("insurance_required"):
         ins_types = filters["insurance_required"]
         if isinstance(ins_types, str):
@@ -808,8 +826,6 @@ async def fetch_carriers(filters: dict) -> dict:
 
     if filters.get("bipd_min"):
         raw_min = int(filters["bipd_min"])
-        # max_cov_amount is stored in thousands (e.g. 750 = $750,000)
-        # If the user typed a value >= 10000, assume they meant full dollars and convert to thousands
         compare_min = raw_min // 1000 if raw_min >= 10000 else raw_min
         conditions.append(
             f"EXISTS (SELECT 1 FROM insurance_history ih WHERE ih.docket_number = 'MC' || mc_number "
@@ -819,8 +835,6 @@ async def fetch_carriers(filters: dict) -> dict:
         idx += 1
     if filters.get("bipd_max"):
         raw_max = int(filters["bipd_max"])
-        # max_cov_amount is stored in thousands (e.g. 750 = $750,000)
-        # If the user typed a value >= 10000, assume they meant full dollars and convert to thousands
         compare_max = raw_max // 1000 if raw_max >= 10000 else raw_max
         conditions.append(
             f"EXISTS (SELECT 1 FROM insurance_history ih WHERE ih.docket_number = 'MC' || mc_number "
@@ -829,10 +843,7 @@ async def fetch_carriers(filters: dict) -> dict:
         params.append(compare_max)
         idx += 1
 
-    # effective_date is stored as MM/DD/YYYY (e.g. 05/18/2020)
-    # Convert input from YYYY-MM-DD to MM/DD/YYYY so both sides match
     if filters.get("ins_effective_date_from"):
-        # Convert 2026-03-01 -> 03/01/2026
         parts = filters["ins_effective_date_from"].split("-")
         date_from_db_fmt = f"{parts[1]}/{parts[2]}/{parts[0]}"
         conditions.append(
@@ -853,8 +864,6 @@ async def fetch_carriers(filters: dict) -> dict:
         params.append(date_to_db_fmt)
         idx += 1
 
-    # cancl_effective_date is stored as MM/DD/YYYY (e.g. 05/31/2026)
-    # Convert input from YYYY-MM-DD to MM/DD/YYYY so both sides match
     if filters.get("ins_cancellation_date_from"):
         parts = filters["ins_cancellation_date_from"].split("-")
         date_from_db_fmt = f"{parts[1]}/{parts[2]}/{parts[0]}"
@@ -943,7 +952,6 @@ async def fetch_carriers(filters: dict) -> dict:
         params.append(int(filters["inspections_max"]))
         idx += 1
 
-    # ── Insurance Company filter ──────────────────────────────────────────
     _INSURANCE_COMPANY_PATTERNS: dict[str, list[str]] = {
         "GREAT WEST CASUALTY": ["GREAT WEST%"],
         "UNITED FINANCIAL CASUALTY": ["UNITED FINANCIAL%"],
@@ -976,10 +984,6 @@ async def fetch_carriers(filters: dict) -> dict:
                 idx += 1
         conditions.append(f"({' OR '.join(or_clauses)})")
 
-    # ── Renewal Policy Monthly filter ─────────────────────────────────────
-    # Renewal date = next anniversary of effective_date (annual renewal).
-    # "1" means from today to end of next month, "2" means to end of month+2, etc.
-    # Only active policies (cancl_effective_date is null/empty or >= today).
     if filters.get("renewal_policy_months"):
         months = int(filters["renewal_policy_months"])
         conditions.append(
@@ -1012,7 +1016,6 @@ async def fetch_carriers(filters: dict) -> dict:
         params.append(months)
         idx += 1
 
-    # ── Renewal Policy Date range filter ──────────────────────────────────
     if filters.get("renewal_date_from"):
         parts = filters["renewal_date_from"].split("-")
         date_from_db_fmt = f"{parts[1]}/{parts[2]}/{parts[0]}"
@@ -1090,8 +1093,6 @@ async def fetch_carriers(filters: dict) -> dict:
 
     _LIST_COLS = "c.*"
 
-    # Use LEFT JOIN LATERAL to aggregate insurance_history per carrier
-    # in a single pass instead of a correlated subquery per row.
     query = f"""
         SELECT {_LIST_COLS},
           COALESCE(ih_agg.filings, '[]'::jsonb) AS insurance_history_filings
@@ -1122,7 +1123,6 @@ async def fetch_carriers(filters: dict) -> dict:
     """
 
     try:
-        # Run data + count queries in parallel for ~2x speedup
         rows, count_row = await asyncio.gather(
             pool.fetch(query, *params),
             pool.fetchrow(count_query, *params),
