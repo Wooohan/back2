@@ -1,18 +1,16 @@
 import httpx
 import re
 import asyncio
+import time
 from bs4 import BeautifulSoup
 from datetime import datetime
 from typing import Optional
-
-
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
     "Connection": "keep-alive",
 }
-
 INSURANCE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -24,11 +22,8 @@ INSURANCE_HEADERS = {
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Site": "same-origin",
 }
-
 _fmcsa_client: Optional[httpx.AsyncClient] = None
 _insurance_client: Optional[httpx.AsyncClient] = None
-
-
 def _get_fmcsa_client() -> httpx.AsyncClient:
     global _fmcsa_client
     if _fmcsa_client is None or _fmcsa_client.is_closed:
@@ -38,8 +33,6 @@ def _get_fmcsa_client() -> httpx.AsyncClient:
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
         )
     return _fmcsa_client
-
-
 def _get_insurance_client() -> httpx.AsyncClient:
     global _insurance_client
     if _insurance_client is None or _insurance_client.is_closed:
@@ -50,8 +43,6 @@ def _get_insurance_client() -> httpx.AsyncClient:
             limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
         )
     return _insurance_client
-
-
 async def close_clients() -> None:
     global _fmcsa_client, _insurance_client
     if _fmcsa_client and not _fmcsa_client.is_closed:
@@ -60,32 +51,53 @@ async def close_clients() -> None:
     if _insurance_client and not _insurance_client.is_closed:
         await _insurance_client.aclose()
         _insurance_client = None
-
-
-async def fetch_fmcsa(url: str, retries: int = 2, delay_ms: int = 300) -> Optional[str]:
+async def fetch_fmcsa(
+    url: str, retries: int = 2, delay_ms: int = 300,
+) -> tuple[Optional[str], dict]:
+    """Return (html_or_none, latency_info_dict)."""
     client = _get_fmcsa_client()
+    total_start = time.perf_counter()
+    last_status: Optional[int] = None
+    last_size: int = 0
+    attempts_made = 0
     for attempt in range(retries + 1):
+        attempts_made = attempt + 1
         try:
+            req_start = time.perf_counter()
             resp = await client.get(url)
+            req_ms = round((time.perf_counter() - req_start) * 1000)
+            last_status = resp.status_code
+            last_size = len(resp.content)
             if 400 <= resp.status_code < 500:
-                return None
+                return None, {
+                    "url": url, "status": resp.status_code,
+                    "latency_ms": req_ms, "size_bytes": last_size,
+                    "attempts": attempts_made,
+                    "total_ms": round((time.perf_counter() - total_start) * 1000),
+                }
             if resp.status_code == 200:
                 text = resp.text
                 if text and len(text) > 100:
-                    return text
+                    return text, {
+                        "url": url, "status": 200,
+                        "latency_ms": req_ms, "size_bytes": last_size,
+                        "attempts": attempts_made,
+                        "total_ms": round((time.perf_counter() - total_start) * 1000),
+                    }
         except Exception:
             pass
         if attempt < retries:
             await asyncio.sleep(delay_ms * (attempt + 1) / 1000)
-    return None
-
-
+    return None, {
+        "url": url, "status": last_status,
+        "latency_ms": 0, "size_bytes": last_size,
+        "attempts": attempts_made,
+        "total_ms": round((time.perf_counter() - total_start) * 1000),
+    }
 def clean_text(text: Optional[str]) -> str:
     if not text:
         return ""
     return re.sub(r"\s+", " ", text.replace("\xa0", " ").replace("\n", " ")).strip()
-
-
 def cf_decode_email(encoded: str) -> str:
     try:
         r = int(encoded[:2], 16)
@@ -95,8 +107,6 @@ def cf_decode_email(encoded: str) -> str:
         return email
     except Exception:
         return ""
-
-
 def find_value_by_label(soup: BeautifulSoup, label: str) -> str:
     for th in soup.find_all("th"):
         th_text = clean_text(th.get_text())
@@ -105,8 +115,6 @@ def find_value_by_label(soup: BeautifulSoup, label: str) -> str:
             if td:
                 return clean_text(td.get_text())
     return ""
-
-
 def find_marked_labels(soup: BeautifulSoup, summary: str) -> list[str]:
     table = soup.find("table", attrs={"summary": summary})
     if not table:
@@ -118,67 +126,55 @@ def find_marked_labels(soup: BeautifulSoup, summary: str) -> list[str]:
             if next_cell:
                 labels.append(clean_text(next_cell.get_text()))
     return labels
-
-
-async def find_dot_email(dot_number: str) -> str:
+async def find_dot_email(dot_number: str) -> tuple[str, dict]:
     if not dot_number:
-        return ""
-    html = await fetch_fmcsa(
+        return "", {}
+    html, lat = await fetch_fmcsa(
         f"https://ai.fmcsa.dot.gov/SMS/Carrier/{dot_number}/CarrierRegistration.aspx"
     )
     if not html:
-        return ""
-
+        return "", lat
     soup = BeautifulSoup(html, "lxml")
-
     for label_tag in soup.find_all("label"):
         label_text = label_tag.get_text() or ""
         if "Email:" not in label_text:
             continue
-
         parent = label_tag.parent
         if parent:
             cf_el = parent.find(attrs={"data-cfemail": True})
             if cf_el:
-                return cf_decode_email(cf_el.get("data-cfemail", ""))
+                return cf_decode_email(cf_el.get("data-cfemail", "")), lat
             parent_text = clean_text(parent.get_text().replace("Email:", ""))
             if parent_text and "@" in parent_text:
-                return parent_text
-
+                return parent_text, lat
         sibling = label_tag.find_next_sibling()
         if sibling:
             if sibling.get("data-cfemail"):
-                return cf_decode_email(sibling["data-cfemail"])
+                return cf_decode_email(sibling["data-cfemail"]), lat
             cf_child = sibling.find(attrs={"data-cfemail": True})
             if cf_child:
-                return cf_decode_email(cf_child.get("data-cfemail", ""))
+                return cf_decode_email(cf_child.get("data-cfemail", "")), lat
             txt = clean_text(sibling.get_text())
             if txt and len(txt) > 4 and "email protected" not in txt.lower():
-                return txt
-    return ""
-
-
-async def fetch_safety_data(dot: str) -> dict:
+                return txt, lat
+    return "", lat
+async def fetch_safety_data(dot: str) -> tuple[dict, dict]:
+    empty = {"rating": "N/A", "ratingDate": "", "basicScores": [], "oosRates": []}
     if not dot:
-        return {"rating": "N/A", "ratingDate": "", "basicScores": [], "oosRates": []}
-
-    html = await fetch_fmcsa(
+        return empty, {}
+    html, lat = await fetch_fmcsa(
         f"https://ai.fmcsa.dot.gov/SMS/Carrier/{dot}/CompleteProfile.aspx"
     )
     if not html:
-        return {"rating": "N/A", "ratingDate": "", "basicScores": [], "oosRates": []}
-
+        return empty, lat
     soup = BeautifulSoup(html, "lxml")
-
     rating_el = soup.find(id="Rating")
     rating = clean_text(rating_el.get_text()) if rating_el else "NOT RATED"
-
     rating_date_el = soup.find(id="RatingDate")
     rating_date = ""
     if rating_date_el:
         rd = clean_text(rating_date_el.get_text())
         rating_date = re.sub(r"Rating Date:|[()]", "", rd).strip()
-
     categories = [
         "Unsafe Driving", "Crash Indicator", "HOS Compliance",
         "Vehicle Maintenance", "Controlled Substances", "Hazmat Compliance", "Driver Fitness",
@@ -192,7 +188,6 @@ async def fetch_safety_data(dot: str) -> dict:
                 val_span = cell.find("span", class_="val")
                 val = clean_text(val_span.get_text()) if val_span else clean_text(cell.get_text())
                 basic_scores.append({"category": categories[i], "measure": val or "0.00"})
-
     oos_rates: list[dict] = []
     safety_rating_div = soup.find(id="SafetyRating")
     if safety_rating_div:
@@ -210,29 +205,24 @@ async def fetch_safety_data(dot: str) -> dict:
                                 "rate": clean_text(cols[1].get_text()),
                                 "nationalAvg": clean_text(cols[2].get_text()),
                             })
-
     return {
         "rating": rating,
         "ratingDate": rating_date,
         "basicScores": basic_scores,
         "oosRates": oos_rates,
-    }
-
-
-async def fetch_inspection_and_crash_data(dot: str) -> dict:
+    }, lat
+async def fetch_inspection_and_crash_data(dot: str) -> tuple[dict, dict]:
+    empty = {"inspections": [], "crashes": []}
     if not dot:
-        return {"inspections": [], "crashes": []}
-
-    html = await fetch_fmcsa(
+        return empty, {}
+    html, lat = await fetch_fmcsa(
         f"https://ai.fmcsa.dot.gov/SMS/Carrier/{dot}/CompleteProfile.aspx"
     )
     if not html:
-        return {"inspections": [], "crashes": []}
-
+        return empty, lat
     soup = BeautifulSoup(html, "lxml")
     inspections: list[dict] = []
     crashes: list[dict] = []
-
     try:
         i_table = soup.find("table", id="inspectionTable")
         if i_table:
@@ -281,7 +271,6 @@ async def fetch_inspection_and_crash_data(dot: str) -> dict:
                             current_report["vehicleViolations"] += 1
                 if current_report:
                     inspections.append(current_report)
-
         c_table = soup.find("table", id="crashTable")
         if c_table:
             c_tbody = c_table.find("tbody", class_="dataBody")
@@ -300,19 +289,14 @@ async def fetch_inspection_and_crash_data(dot: str) -> dict:
                         })
     except Exception as e:
         print(f"Error parsing inspection/crash data: {e}")
-
-    return {"inspections": inspections, "crashes": crashes}
-
-
+    return {"inspections": inspections, "crashes": crashes}, lat
 async def fetch_insurance_data(dot: str) -> dict:
     if not dot:
         return {"policies": [], "raw": None}
-
     urls_to_try = [
         f"https://searchcarriers.com/company/{dot}/insurances",
         f"https://searchcarriers.com/api/company/{dot}/insurances",
     ]
-
     client = _get_insurance_client()
     result = None
     for target_url in urls_to_try:
@@ -335,13 +319,10 @@ async def fetch_insurance_data(dot: str) -> dict:
                 pass
             if attempt < 1:
                 await asyncio.sleep(0.1 * (attempt + 1))
-
     if result is None:
         return {"policies": [], "raw": None}
-
     raw_data = result.get("data", result if isinstance(result, list) else [])
     policies: list[dict] = []
-
     if isinstance(raw_data, list):
         for p in raw_data:
             carrier_name = str(
@@ -351,14 +332,11 @@ async def fetch_insurance_data(dot: str) -> dict:
                 or p.get("company_name")
                 or "NOT SPECIFIED"
             ).upper()
-
             policy_number = str(
                 p.get("policy_no") or p.get("policy_number") or p.get("pol_num") or "N/A"
             ).upper()
-
             eff_date_raw = p.get("effective_date", "")
             effective_date = eff_date_raw.split(" ")[0] if eff_date_raw else "N/A"
-
             coverage = p.get("max_cov_amount") or p.get("coverage_to") or p.get("coverage_amount") or "N/A"
             if coverage != "N/A":
                 try:
@@ -369,7 +347,6 @@ async def fetch_insurance_data(dot: str) -> dict:
                         coverage = f"${int(num):,}"
                 except (ValueError, TypeError):
                     pass
-
             ins_type = str(p.get("ins_type_code", "N/A"))
             if ins_type == "1":
                 ins_type = "BI&PD"
@@ -377,13 +354,11 @@ async def fetch_insurance_data(dot: str) -> dict:
                 ins_type = "CARGO"
             elif ins_type == "3":
                 ins_type = "BOND"
-
             ins_class = str(p.get("ins_class_code", "N/A")).upper()
             if ins_class == "P":
                 ins_class = "PRIMARY"
             elif ins_class == "E":
                 ins_class = "EXCESS"
-
             policies.append({
                 "dot": dot,
                 "carrier": carrier_name,
@@ -393,41 +368,39 @@ async def fetch_insurance_data(dot: str) -> dict:
                 "type": ins_type,
                 "class": ins_class,
             })
-
     return {"policies": policies, "raw": result}
-
-
 async def scrape_carrier(mc_number: str) -> Optional[dict]:
-    html = await fetch_fmcsa(
+    carrier_start = time.perf_counter()
+    html, snapshot_lat = await fetch_fmcsa(
         f"https://safer.fmcsa.dot.gov/query.asp?searchtype=ANY&query_type=queryCarrierSnapshot&query_param=MC_MX&query_string={mc_number}"
     )
     if not html:
         return None
-
     soup = BeautifulSoup(html, "lxml")
     if not soup.find("center"):
         return None
-
     get_val = lambda label: find_value_by_label(soup, label)
-
     dot_number = get_val("USDOT Number:")
-
     status = get_val("Operating Authority Status:")
     status = re.sub(r"(\*Please Note|Please Note|For Licensing)[\s\S]*", "", status, flags=re.IGNORECASE).strip()
     status = re.sub(r"\s+", " ", status)
-
+    email_lat: dict = {}
+    safety_lat: dict = {}
+    insp_lat: dict = {}
     if dot_number:
         email_task = find_dot_email(dot_number)
         safety_task = fetch_safety_data(dot_number)
         inspection_task = fetch_inspection_and_crash_data(dot_number)
-        email, safety, insp_data = await asyncio.gather(email_task, safety_task, inspection_task)
+        results = await asyncio.gather(email_task, safety_task, inspection_task)
+        email, email_lat = results[0]
+        safety, safety_lat = results[1]
+        insp_data, insp_lat = results[2]
     else:
         email, safety, insp_data = "", None, None
-
     clean_email = re.sub(r"[\[\]Â]", "", email).strip()
     if "email protected" in clean_email.lower():
         clean_email = ""
-
+    total_ms = round((time.perf_counter() - carrier_start) * 1000)
     return {
         "mcNumber": mc_number,
         "dotNumber": dot_number,
@@ -457,4 +430,11 @@ async def scrape_carrier(mc_number: str) -> Optional[dict]:
         "oosRates": safety["oosRates"] if safety else [],
         "inspections": insp_data["inspections"] if insp_data else [],
         "crashes": insp_data["crashes"] if insp_data else [],
+        "_latency": {
+            "total_ms": total_ms,
+            "snapshot": snapshot_lat,
+            "email": email_lat,
+            "safety": safety_lat,
+            "inspections": insp_lat,
+        },
     }
