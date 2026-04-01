@@ -4,7 +4,6 @@ from datetime import datetime, timezone
 from typing import Optional
 from app.scraper import scrape_carrier, fetch_insurance_data
 from app.database import upsert_carrier, update_carrier_insurance
-
 _MAX_COMPLETED_TASKS = 20
 class TaskManager:
     def __init__(self):
@@ -139,6 +138,10 @@ class TaskManager:
                     data = None
                 completed += 1
                 if data:
+                    # Extract and log latency info
+                    latency = data.pop("_latency", None)
+                    if latency:
+                        self._log_latency(task_id, mc, latency)
                     entity_type = (data.get("entityType") or "").upper()
                     status_text = (data.get("status") or "").upper()
                     is_carrier = "CARRIER" in entity_type
@@ -274,6 +277,32 @@ class TaskManager:
             return_exceptions=True,
         )
         return sum(1 for ok in results if ok is True)
+    def _log_latency(self, task_id: str, mc: str, latency: dict):
+        """Emit structured latency log lines for a single MC# scrape."""
+        total = latency.get("total_ms", 0)
+        parts: list[str] = []
+        for label, key in [
+            ("snapshot", "snapshot"),
+            ("email", "email"),
+            ("safety", "safety"),
+            ("inspections", "inspections"),
+        ]:
+            info = latency.get(key)
+            if info and isinstance(info, dict):
+                ms = info.get("latency_ms", 0)
+                status = info.get("status", "?")
+                size = info.get("size_bytes", 0)
+                attempts = info.get("attempts", 1)
+                size_kb = round(size / 1024, 1) if size else 0
+                part = f"{label}={ms}ms|{status}|{size_kb}KB"
+                if attempts > 1:
+                    part += f"|{attempts}att"
+                parts.append(part)
+        breakdown = "  ".join(parts) if parts else "no sub-requests"
+        self._add_log(
+            task_id,
+            f"[Latency] MC {mc}: total={total}ms | {breakdown}",
+        )
     def _add_log(self, task_id: str, message: str):
         if task_id in self.tasks:
             logs = self.tasks[task_id]["logs"]
