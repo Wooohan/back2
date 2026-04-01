@@ -234,7 +234,7 @@ async def scrape_single_carrier(mc_number: str):
     return JSONResponse(status_code=404, content={"error": "No data found"})
 @app.get("/api/scrape/safety/{dot_number}")
 async def scrape_safety(dot_number: str):
-    data = await fetch_safety_data(dot_number)
+    data, _lat = await fetch_safety_data(dot_number)
     return data
 @app.get("/api/scrape/insurance/{dot_number}")
 async def scrape_insurance(dot_number: str):
