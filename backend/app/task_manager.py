@@ -6,10 +6,23 @@ from app.scraper import scrape_carrier, fetch_insurance_data
 from app.database import upsert_carrier, update_carrier_insurance
 
 _MAX_COMPLETED_TASKS = 20
+
+# ---------------------------------------------------------------------------
+# Throttle configuration
+# ---------------------------------------------------------------------------
+# Target: 10,000 MC records in 2 hours (7200 seconds)
+# => 0.72 seconds per record on average
+# Each record makes ~2 HTTP requests concurrently (snapshot + profile/email),
+# so we add a delay BETWEEN records to stay gentle on the server.
+# 0.72s per record = ~1.39 records/sec => safe and steady pace.
+SCRAPER_DELAY_SECONDS = 0.72
+
+
 class TaskManager:
     def __init__(self):
         self.tasks: dict[str, dict] = {}
         self._running_tasks: dict[str, asyncio.Task] = {}
+
     async def start_scraper_task(self, config: dict) -> str:
         task_id = str(uuid.uuid4())[:8]
         start_point = int(config.get("startPoint", "1580000"))
@@ -32,6 +45,7 @@ class TaskManager:
                 f"[{self._now()}] Task {task_id} started",
                 f"[{self._now()}] Targeting {record_count} records starting at MC# {start_point}",
                 f"[{self._now()}] Filters: carriers={include_carriers}, brokers={include_brokers}, authorized_only={only_authorized}",
+                f"[{self._now()}] Throttle: {SCRAPER_DELAY_SECONDS}s delay per record (~{int(3600 / SCRAPER_DELAY_SECONDS)} records/hr)",
             ],
             "scrapedData": [],
             "startedAt": datetime.now(timezone.utc).isoformat(),
@@ -43,6 +57,7 @@ class TaskManager:
         )
         self._running_tasks[task_id] = async_task
         return task_id
+
     async def start_insurance_task(self, config: dict) -> str:
         task_id = str(uuid.uuid4())[:8]
         dot_numbers = config.get("dotNumbers", [])
@@ -69,6 +84,7 @@ class TaskManager:
         )
         self._running_tasks[task_id] = async_task
         return task_id
+
     def stop_task(self, task_id: str):
         task = self.tasks.get(task_id)
         if not task:
@@ -80,6 +96,7 @@ class TaskManager:
         self._add_log(task_id, "Stop signal received. Finishing current operation...")
         if task_id in self._running_tasks:
             self._running_tasks[task_id].cancel()
+
     def get_task_status(self, task_id: str) -> Optional[dict]:
         task = self.tasks.get(task_id)
         if not task:
@@ -89,11 +106,13 @@ class TaskManager:
         result["recentData"] = task.get("scrapedData", [])[-20:]
         result["logs"] = task.get("logs", [])[-100:]
         return result
+
     def get_task_data(self, task_id: str) -> Optional[list]:
         task = self.tasks.get(task_id)
         if not task:
             return None
         return task.get("scrapedData", [])
+
     def get_active_task_id(self, task_type: str) -> Optional[str]:
         candidates = [(tid, t) for tid, t in self.tasks.items() if t.get("type") == task_type]
         if not candidates:
@@ -102,6 +121,7 @@ class TaskManager:
         if active:
             return active[-1][0]
         return None
+
     def list_tasks(self) -> list[dict]:
         result = []
         for task_id, task in self.tasks.items():
@@ -114,6 +134,7 @@ class TaskManager:
                 "stoppedAt": task.get("stoppedAt"),
             })
         return result
+
     async def _run_scraper(self, task_id: str, start: int, total: int,
                            include_carriers: bool, include_brokers: bool,
                            only_authorized: bool):
@@ -155,14 +176,14 @@ class TaskManager:
                         extracted += 1
                         task["scrapedData"].append(data)
                         batch_buffer.append(data)
-                        self._add_log(task_id, f"[Success] MC {mc}: {data.get("legalName", "Unknown")}")
+                        self._add_log(task_id, f"[Success] MC {mc}: {data.get('legalName', 'Unknown')}")
                         if len(batch_buffer) >= BATCH_SIZE:
                             saved = await self._save_batch_to_db(batch_buffer)
                             db_saved += saved
                             self._add_log(task_id, f"DB Sync: {saved}/{len(batch_buffer)} records saved")
                             batch_buffer = []
                     else:
-                        self._add_log(task_id, f"[Filtered] MC {mc}: {data.get("legalName", "")} (didn't match filters)")
+                        self._add_log(task_id, f"[Filtered] MC {mc}: {data.get('legalName', '')} (didn't match filters)")
                 else:
                     failed += 1
                     self._add_log(task_id, f"[No Data] MC {mc}")
@@ -171,6 +192,12 @@ class TaskManager:
                 task["dbSaved"] = db_saved
                 task["failed"] = failed
                 task["progress"] = round((completed / total) * 100)
+
+                # Throttle: wait between records to avoid hammering the server
+                # Target pace: 10k records in 2 hours => ~0.72s per record
+                if task["status"] != "stopping" and i < total - 1:
+                    await asyncio.sleep(SCRAPER_DELAY_SECONDS)
+
         except asyncio.CancelledError:
             self._add_log(task_id, "Task cancelled. Saving remaining batch...")
         if batch_buffer:
@@ -188,12 +215,13 @@ class TaskManager:
         if task_id in self._running_tasks:
             del self._running_tasks[task_id]
         self._cleanup_old_tasks()
+
     async def _run_insurance(self, task_id: str, dot_numbers: list[str]):
         task = self.tasks[task_id]
         ins_found = 0
         db_saved_count = 0
         failed_count = 0
-        REQUEST_DELAY = 0.333
+        REQUEST_DELAY = 0.5
         try:
             for i, dot in enumerate(dot_numbers):
                 if task["status"] == "stopping":
@@ -235,6 +263,7 @@ class TaskManager:
         if task_id in self._running_tasks:
             del self._running_tasks[task_id]
         self._cleanup_old_tasks()
+
     async def _save_batch_to_db(self, batch: list[dict]) -> int:
         records = []
         for carrier in batch:
@@ -274,12 +303,14 @@ class TaskManager:
             return_exceptions=True,
         )
         return sum(1 for ok in results if ok is True)
+
     def _add_log(self, task_id: str, message: str):
         if task_id in self.tasks:
             logs = self.tasks[task_id]["logs"]
             logs.append(f"[{self._now()}] {message}")
             if len(logs) > 500:
                 self.tasks[task_id]["logs"] = logs[-500:]
+
     def _cleanup_old_tasks(self):
         completed = [
             (tid, t) for tid, t in self.tasks.items()
@@ -290,7 +321,10 @@ class TaskManager:
             for tid, _ in completed[:len(completed) - _MAX_COMPLETED_TASKS]:
                 del self.tasks[tid]
                 self._running_tasks.pop(tid, None)
+
     def _now(self) -> str:
         return datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+
 # Singleton instance
 task_manager = TaskManager()
