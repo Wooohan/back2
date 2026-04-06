@@ -35,7 +35,7 @@ def _get_fmcsa_client() -> httpx.AsyncClient:
         _fmcsa_client = httpx.AsyncClient(
             timeout=15.0,
             headers=HEADERS,
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            limits=httpx.Limits(max_connections=5, max_keepalive_connections=3),
         )
     return _fmcsa_client
 
@@ -47,7 +47,7 @@ def _get_insurance_client() -> httpx.AsyncClient:
             timeout=15.0,
             headers=INSURANCE_HEADERS,
             follow_redirects=True,
-            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+            limits=httpx.Limits(max_connections=5, max_keepalive_connections=3),
         )
     return _insurance_client
 
@@ -62,7 +62,8 @@ async def close_clients() -> None:
         _insurance_client = None
 
 
-async def fetch_fmcsa(url: str, retries: int = 2, delay_ms: int = 300) -> Optional[str]:
+async def fetch_fmcsa(url: str, retries: int = 2, delay_ms: int = 500) -> Optional[str]:
+    """Fetch a page from FMCSA with retry logic and throttling."""
     client = _get_fmcsa_client()
     for attempt in range(retries + 1):
         try:
@@ -158,18 +159,8 @@ async def find_dot_email(dot_number: str) -> str:
     return ""
 
 
-async def fetch_safety_data(dot: str) -> dict:
-    if not dot:
-        return {"rating": "N/A", "ratingDate": "", "basicScores": [], "oosRates": []}
-
-    html = await fetch_fmcsa(
-        f"https://ai.fmcsa.dot.gov/SMS/Carrier/{dot}/CompleteProfile.aspx"
-    )
-    if not html:
-        return {"rating": "N/A", "ratingDate": "", "basicScores": [], "oosRates": []}
-
-    soup = BeautifulSoup(html, "lxml")
-
+def parse_safety_data(soup: BeautifulSoup) -> dict:
+    """Parse safety rating, BASIC scores, and OOS rates from a CompleteProfile soup."""
     rating_el = soup.find(id="Rating")
     rating = clean_text(rating_el.get_text()) if rating_el else "NOT RATED"
 
@@ -219,17 +210,8 @@ async def fetch_safety_data(dot: str) -> dict:
     }
 
 
-async def fetch_inspection_and_crash_data(dot: str) -> dict:
-    if not dot:
-        return {"inspections": [], "crashes": []}
-
-    html = await fetch_fmcsa(
-        f"https://ai.fmcsa.dot.gov/SMS/Carrier/{dot}/CompleteProfile.aspx"
-    )
-    if not html:
-        return {"inspections": [], "crashes": []}
-
-    soup = BeautifulSoup(html, "lxml")
+def parse_inspection_and_crash_data(soup: BeautifulSoup) -> dict:
+    """Parse inspection and crash tables from a CompleteProfile soup."""
     inspections: list[dict] = []
     crashes: list[dict] = []
 
@@ -304,6 +286,76 @@ async def fetch_inspection_and_crash_data(dot: str) -> dict:
     return {"inspections": inspections, "crashes": crashes}
 
 
+async def fetch_complete_profile(dot: str) -> dict:
+    """Fetch CompleteProfile page ONCE and parse both safety + inspection/crash data.
+
+    This eliminates the duplicate HTTP request that previously occurred when
+    fetch_safety_data() and fetch_inspection_and_crash_data() each fetched
+    the same URL independently. Reduces HTTP requests per carrier from 3 to 2.
+    """
+    empty_result = {
+        "rating": "N/A",
+        "ratingDate": "",
+        "basicScores": [],
+        "oosRates": [],
+        "inspections": [],
+        "crashes": [],
+    }
+
+    if not dot:
+        return empty_result
+
+    html = await fetch_fmcsa(
+        f"https://ai.fmcsa.dot.gov/SMS/Carrier/{dot}/CompleteProfile.aspx"
+    )
+    if not html:
+        return empty_result
+
+    soup = BeautifulSoup(html, "lxml")
+
+    # Parse both datasets from the same soup (single HTTP request)
+    safety = parse_safety_data(soup)
+    insp_crash = parse_inspection_and_crash_data(soup)
+
+    return {
+        "rating": safety["rating"],
+        "ratingDate": safety["ratingDate"],
+        "basicScores": safety["basicScores"],
+        "oosRates": safety["oosRates"],
+        "inspections": insp_crash["inspections"],
+        "crashes": insp_crash["crashes"],
+    }
+
+
+# Keep legacy functions for backward compatibility (used by main.py endpoints)
+async def fetch_safety_data(dot: str) -> dict:
+    if not dot:
+        return {"rating": "N/A", "ratingDate": "", "basicScores": [], "oosRates": []}
+
+    html = await fetch_fmcsa(
+        f"https://ai.fmcsa.dot.gov/SMS/Carrier/{dot}/CompleteProfile.aspx"
+    )
+    if not html:
+        return {"rating": "N/A", "ratingDate": "", "basicScores": [], "oosRates": []}
+
+    soup = BeautifulSoup(html, "lxml")
+    return parse_safety_data(soup)
+
+
+async def fetch_inspection_and_crash_data(dot: str) -> dict:
+    if not dot:
+        return {"inspections": [], "crashes": []}
+
+    html = await fetch_fmcsa(
+        f"https://ai.fmcsa.dot.gov/SMS/Carrier/{dot}/CompleteProfile.aspx"
+    )
+    if not html:
+        return {"inspections": [], "crashes": []}
+
+    soup = BeautifulSoup(html, "lxml")
+    return parse_inspection_and_crash_data(soup)
+
+
 async def fetch_insurance_data(dot: str) -> dict:
     if not dot:
         return {"policies": [], "raw": None}
@@ -334,7 +386,7 @@ async def fetch_insurance_data(dot: str) -> dict:
             except Exception:
                 pass
             if attempt < 1:
-                await asyncio.sleep(0.1 * (attempt + 1))
+                await asyncio.sleep(0.2 * (attempt + 1))
 
     if result is None:
         return {"policies": [], "raw": None}
@@ -398,6 +450,11 @@ async def fetch_insurance_data(dot: str) -> dict:
 
 
 async def scrape_carrier(mc_number: str) -> Optional[dict]:
+    """Scrape a single carrier by MC number.
+
+    Uses fetch_complete_profile() to get safety + inspection/crash data
+    in a single HTTP request instead of two separate ones.
+    """
     html = await fetch_fmcsa(
         f"https://safer.fmcsa.dot.gov/query.asp?searchtype=ANY&query_type=queryCarrierSnapshot&query_param=MC_MX&query_string={mc_number}"
     )
@@ -417,12 +474,21 @@ async def scrape_carrier(mc_number: str) -> Optional[dict]:
     status = re.sub(r"\s+", " ", status)
 
     if dot_number:
+        # Fetch email and complete profile concurrently
+        # complete_profile fetches the page ONCE for both safety + inspection/crash data
         email_task = find_dot_email(dot_number)
-        safety_task = fetch_safety_data(dot_number)
-        inspection_task = fetch_inspection_and_crash_data(dot_number)
-        email, safety, insp_data = await asyncio.gather(email_task, safety_task, inspection_task)
+        profile_task = fetch_complete_profile(dot_number)
+        email, profile = await asyncio.gather(email_task, profile_task)
     else:
-        email, safety, insp_data = "", None, None
+        email = ""
+        profile = {
+            "rating": "N/A",
+            "ratingDate": "",
+            "basicScores": [],
+            "oosRates": [],
+            "inspections": [],
+            "crashes": [],
+        }
 
     clean_email = re.sub(r"[\[\]Â]", "", email).strip()
     if "email protected" in clean_email.lower():
@@ -451,10 +517,10 @@ async def scrape_carrier(mc_number: str) -> Optional[dict]:
         "outOfServiceDate": get_val("Out of Service Date:"),
         "stateCarrierId": get_val("State Carrier ID Number:"),
         "dunsNumber": get_val("DUNS Number:"),
-        "safetyRating": safety["rating"] if safety else "NOT RATED",
-        "safetyRatingDate": safety["ratingDate"] if safety else "",
-        "basicScores": safety["basicScores"] if safety else [],
-        "oosRates": safety["oosRates"] if safety else [],
-        "inspections": insp_data["inspections"] if insp_data else [],
-        "crashes": insp_data["crashes"] if insp_data else [],
+        "safetyRating": profile["rating"],
+        "safetyRatingDate": profile["ratingDate"],
+        "basicScores": profile["basicScores"],
+        "oosRates": profile["oosRates"],
+        "inspections": profile["inspections"],
+        "crashes": profile["crashes"],
     }
