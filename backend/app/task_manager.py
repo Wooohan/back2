@@ -23,7 +23,7 @@ class TaskManager:
         self.tasks: dict[str, dict] = {}
         self._running_tasks: dict[str, asyncio.Task] = {}
 
-    async def start_scraper_task(self, config: dict) -> str:
+    async def start_scraper_task(self, config: dict, user_id: str = "") -> str:
         task_id = str(uuid.uuid4())[:8]
         start_point = int(config.get("startPoint", "1580000"))
         record_count = int(config.get("recordCount", 50))
@@ -33,6 +33,7 @@ class TaskManager:
         self.tasks[task_id] = {
             "id": task_id,
             "type": "scraper",
+            "user_id": user_id,
             "status": "running",
             "config": config,
             "progress": 0,
@@ -58,12 +59,13 @@ class TaskManager:
         self._running_tasks[task_id] = async_task
         return task_id
 
-    async def start_insurance_task(self, config: dict) -> str:
+    async def start_insurance_task(self, config: dict, user_id: str = "") -> str:
         task_id = str(uuid.uuid4())[:8]
         dot_numbers = config.get("dotNumbers", [])
         self.tasks[task_id] = {
             "id": task_id,
             "type": "insurance",
+            "user_id": user_id,
             "status": "running",
             "config": config,
             "progress": 0,
@@ -113,8 +115,11 @@ class TaskManager:
             return None
         return task.get("scrapedData", [])
 
-    def get_active_task_id(self, task_type: str) -> Optional[str]:
+    def get_active_task_id(self, task_type: str, user_id: str = "") -> Optional[str]:
         candidates = [(tid, t) for tid, t in self.tasks.items() if t.get("type") == task_type]
+        # If user_id is provided, filter to only that user's tasks
+        if user_id:
+            candidates = [(tid, t) for tid, t in candidates if t.get("user_id") == user_id]
         if not candidates:
             return None
         active = [c for c in candidates if c[1].get("status") in ("running", "stopping")]
