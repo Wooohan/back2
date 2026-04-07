@@ -244,7 +244,9 @@ async def scrape_insurance(dot_number: str):
 async def start_scraper_task(request: Request):
     body = await request.json()
     config = body.get("config", {})
-    task_id = await task_manager.start_scraper_task(config)
+    user = getattr(request.state, "user", None)
+    user_id = user.get("sub", "") if user else ""
+    task_id = await task_manager.start_scraper_task(config, user_id=user_id)
     return {"task_id": task_id, "status": "started"}
 @app.post("/api/tasks/scraper/stop")
 async def stop_scraper_task(request: Request):
@@ -264,7 +266,9 @@ async def get_scraper_status(task_id: str = Query(...)):
 async def start_insurance_task(request: Request):
     body = await request.json()
     config = body.get("config", {})
-    task_id = await task_manager.start_insurance_task(config)
+    user = getattr(request.state, "user", None)
+    user_id = user.get("sub", "") if user else ""
+    task_id = await task_manager.start_insurance_task(config, user_id=user_id)
     return {"task_id": task_id, "status": "started"}
 @app.post("/api/tasks/insurance/stop")
 async def stop_insurance_task(request: Request):
@@ -287,8 +291,10 @@ async def get_scraper_data(task_id: str = Query(...)):
         return JSONResponse(status_code=404, content={"error": "Task not found"})
     return data
 @app.get("/api/tasks/active")
-async def get_active_task(task_type: str = Query("scraper")):
-    task_id = task_manager.get_active_task_id(task_type)
+async def get_active_task(request: Request, task_type: str = Query("scraper")):
+    user = getattr(request.state, "user", None)
+    user_id = user.get("sub", "") if user else ""
+    task_id = task_manager.get_active_task_id(task_type, user_id=user_id)
     if not task_id:
         return {"task_id": None}
     status = task_manager.get_task_status(task_id)
